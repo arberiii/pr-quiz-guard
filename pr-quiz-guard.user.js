@@ -179,6 +179,7 @@
           'content-type': 'application/json',
           'x-api-key': apiKey,
           'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
         },
         data: JSON.stringify(body),
       });
@@ -244,42 +245,53 @@
       additionalProperties: false,
     };
 
+    // Rough count of added/removed lines (excludes the +++/--- file headers), used
+    // to anchor the model's question count to actual diff size instead of its own
+    // fuzzy sense of "small".
+    function countChangedLines(diff) {
+      return diff
+        .split('\n')
+        .filter((l) => (l.startsWith('+') || l.startsWith('-')) && !l.startsWith('+++') && !l.startsWith('---'))
+        .length;
+    }
+
     function generateQuiz(diff, title, description) {
+      const changedLines = countChangedLines(diff);
       return callClaude({
         system:
-          'You are a strict code-review comprehension quiz generator. You will be given a pull ' +
-          'request title, its description (the "why" - the problem being fixed, the goal), and its ' +
-          'unified diff (the "what" and "how"). Use the description only for context on intent - ' +
-          'never ask about it directly, and never ask questions answerable just by reading the ' +
-          'description or title ("what problem does this fix", "what is the goal of this PR"). ' +
-          'Every question must be about the actual code change: pick specific functions, variables, ' +
-          'branches, or lines from the diff and probe whether the reviewer traced through them. ' +
-          'Favor questions like: what happens if [a specific input] is empty/null/unexpected at ' +
-          '[specific line]; why was [specific implementation choice] made instead of [an obvious ' +
-          'alternative]; what would break if [specific line/check] were removed; what is the failure ' +
-          'or edge case this change does NOT handle; how does this interact with [other code visible ' +
-          'in the diff, e.g. a caller or a related branch]. Avoid questions with an obvious, one-word, ' +
-          'or purely descriptive answer - each question should require the reviewer to have actually ' +
-          'reasoned through the diff\'s logic, not just skimmed it. Never ask generic questions like ' +
-          '"what does this PR do" or "summarize the changes". ' +
-          'Calibrate difficulty to medium: hard enough that answering requires actually understanding ' +
-          'the substance of the change, not so hard that it becomes a gotcha about an obscure detail, ' +
-          'a trick question, or something a careful reviewer would reasonably not have zeroed in on. ' +
-          'The goal is to help a reviewer confirm to themselves that they truly understood the PR, ' +
-          'not to catch them out. If in doubt, prefer the question a thoughtful reviewer who actually ' +
-          'read and understood the diff would find reasonable and answerable, over the cleverest or ' +
-          'most obscure question you could ask. ' +
-          'Write at most 3 questions. Write 3 if the diff has enough distinct substance to support ' +
-          'three good, non-redundant questions. If it is a small or narrow change that only supports ' +
-          'one or two genuinely distinct questions worth asking, write only that many - never pad with ' +
-          'a weak or redundant question just to reach 3. Always write at least 1 question. Assume the ' +
-          'reviewer can see the diff while answering.',
+          'You are a code-review comprehension quiz generator. You will be given a pull ' +
+          'request title, its description (the "why" - the problem being fixed, the goal), its ' +
+          'unified diff (the "what" and "how"), and a count of changed lines in the diff. Use the ' +
+          'description only for context on intent - never ask about it directly, and never ask ' +
+          'questions answerable just by reading the description or title ("what problem does this ' +
+          'fix", "what is the goal of this PR"). Every question must be about the actual code change: ' +
+          'pick specific functions, variables, branches, or lines from the diff and probe whether the ' +
+          'reviewer traced through them. Favor simple, direct questions like: what does [specific ' +
+          'function/line] do; what would happen if [a specific input] were empty/null/unexpected at ' +
+          '[specific line]; what would break if [specific line/check] were removed; how does this ' +
+          'interact with [other code visible in the diff, e.g. a caller or a related branch]. Avoid ' +
+          'questions with an obvious, one-word, or purely descriptive answer - each question should ' +
+          'still require the reviewer to have actually looked at the diff, not just skimmed it. Never ' +
+          'ask generic questions like "what does this PR do" or "summarize the changes". ' +
+          'Keep every question easy: answerable in one short sentence from something directly visible ' +
+          'in the diff, with no multi-step reasoning, no chasing code outside the diff, and no obscure ' +
+          'edge cases or "gotcha" details a reviewer would reasonably skip over. The goal is a quick ' +
+          'sanity check that the reviewer opened and read the diff, not a test of how deep they can go. ' +
+          'When in doubt, pick the easier, more obviously-answerable question every time. ' +
+          'Scale the number of questions to the size of the change, using the changed-line count as the ' +
+          'primary signal: fewer than 15 changed lines -> exactly 1 question; 15 to 60 changed lines -> ' +
+          '1 or 2 questions; more than 60 changed lines -> up to 3 questions, and only write 3 if the ' +
+          'diff genuinely has three distinct, non-redundant things worth asking about. Never pad with a ' +
+          'weak or redundant question just to hit a higher count - fewer good questions is always better ' +
+          'than more weak ones. Always write at least 1 question. Assume the reviewer can see the diff ' +
+          'while answering.',
         messages: [
           {
             role: 'user',
             content:
               `PR title: ${title}\n\n` +
               (description ? `PR description:\n${description}\n\n` : '') +
+              `Changed lines in diff: ${changedLines}\n\n` +
               `Diff:\n${diff}`,
           },
         ],
