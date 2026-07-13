@@ -1,0 +1,25 @@
+{
+  "manifest_version": 3,
+  "name": "PR Quiz Guard",
+  "version": "1.3.0",
+  "description": "Blocks GitHub PR \"Approve\" until you pass a short comprehension quiz generated from the actual diff.",
+  "permissions": ["storage"],
+  "host_permissions": [
+    "https://api.anthropic.com/*",
+    "https://github.com/*",
+    "https://patch-diff.githubusercontent.com/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://github.com/*/*/pull/*"],
+      "js": ["core.js", "content-adapter.js"],
+      "run_at": "document_idle"
+    }
+  ],
+  "action": {
+    "default_popup": "popup.html"
+  }
+}
