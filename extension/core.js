@@ -2,24 +2,177 @@
 //
 // This file contains everything that doesn't depend on Tampermonkey (GM_*) or
 // Chrome-extension (chrome.*) APIs: diff/description fetching (via an injected
-// adapter), the Claude API calls, the modal UI, and the "Approve" button
+// adapter), the LLM provider layer, the modal UI, and the "Approve" button
 // interception. Platform-specific glue lives in userscript/adapter.js and
 // extension/content-adapter.js, each of which builds an `adapter` object and
 // calls PRQuizGuardCore.init(adapter).
 //
 // adapter shape:
 //   {
-//     getApiKey(): Promise<string>,
-//     getModel(): Promise<string>,
+//     getSettings(): Promise<{ provider: string, apiKey: string, model: string }>,
 //     httpRequest({ method, url, headers, data }): Promise<{ status, responseText }>,
-//     apiKeySetupHint: string,   // human-readable instructions shown when no key is set
+//     setupHint: string,   // human-readable instructions shown when no key is set
 //   }
 (function (global) {
   'use strict';
 
-  const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
   const MAX_DIFF_CHARS = 12000;
   const MAX_DESCRIPTION_CHARS = 3000;
+
+  // -------------------------------------------------------------------
+  // LLM providers
+  //
+  // Defined outside init() and exported on PRQuizGuardCore so the extension
+  // popup can render provider choices and build test requests from the same
+  // source of truth. `kind` selects the wire format: 'anthropic' (Messages
+  // API with native structured output) or 'openai' (chat/completions with
+  // json_object mode + schema-in-prompt).
+  // -------------------------------------------------------------------
+
+  const DEFAULT_PROVIDER = 'free';
+
+  const PROVIDERS = {
+    free: {
+      id: 'free',
+      label: 'Free',
+      tagline: 'No API key needed',
+      note: 'Community endpoint (pollinations.ai). Rate-limited but plenty for quizzes — works with zero setup.',
+      kind: 'openai',
+      url: 'https://text.pollinations.ai/openai',
+      needsKey: false,
+      defaultModel: 'openai-fast',
+      models: ['openai-fast'],
+      keyUrl: null,
+      keyPlaceholder: null,
+    },
+    mistral: {
+      id: 'mistral',
+      label: 'Mistral',
+      tagline: 'Free tier · key required',
+      note: 'Official Mistral API. The Experiment plan is free — create a key at console.mistral.ai.',
+      kind: 'openai',
+      url: 'https://api.mistral.ai/v1/chat/completions',
+      needsKey: true,
+      defaultModel: 'mistral-small-latest',
+      models: ['mistral-small-latest', 'mistral-medium-latest', 'mistral-large-latest', 'open-mistral-nemo'],
+      keyUrl: 'https://console.mistral.ai/api-keys',
+      keyPlaceholder: 'Mistral API key',
+    },
+    anthropic: {
+      id: 'anthropic',
+      label: 'Claude',
+      tagline: 'API key required',
+      note: 'Anthropic API. Create a key at platform.claude.com.',
+      kind: 'anthropic',
+      url: 'https://api.anthropic.com/v1/messages',
+      needsKey: true,
+      defaultModel: 'claude-haiku-4-5',
+      models: ['claude-haiku-4-5', 'claude-sonnet-5'],
+      keyUrl: 'https://platform.claude.com',
+      keyPlaceholder: 'sk-ant-…',
+    },
+  };
+
+  function getProvider(providerId) {
+    return PROVIDERS[providerId] || PROVIDERS[DEFAULT_PROVIDER];
+  }
+
+  // Builds the {method,url,headers,data} for one structured-output chat call.
+  function buildChatRequest(providerId, { apiKey, model, system, messages, schema }) {
+    const provider = getProvider(providerId);
+    if (provider.kind === 'anthropic') {
+      return {
+        method: 'POST',
+        url: provider.url,
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
+        data: JSON.stringify({
+          model,
+          max_tokens: 4096,
+          system,
+          messages,
+          output_config: {
+            format: {
+              type: 'json_schema',
+              schema,
+            },
+          },
+        }),
+      };
+    }
+    // OpenAI-compatible chat/completions (Mistral, Pollinations). These don't
+    // all support strict json_schema output, so ask for json_object mode and
+    // put the schema in the system prompt, then parse defensively.
+    const headers = { 'content-type': 'application/json' };
+    if (apiKey) headers['authorization'] = 'Bearer ' + apiKey;
+    return {
+      method: 'POST',
+      url: provider.url,
+      headers,
+      data: JSON.stringify({
+        model,
+        max_tokens: 4096,
+        messages: [
+          {
+            role: 'system',
+            content:
+              system +
+              '\n\nRespond with ONLY a single JSON object — no prose, no code fences — that conforms exactly to this JSON Schema:\n' +
+              JSON.stringify(schema),
+          },
+        ].concat(messages),
+        response_format: { type: 'json_object' },
+      }),
+    };
+  }
+
+  // Pulls a valid JSON object out of a model reply that may be wrapped in
+  // code fences or surrounded by stray prose (common on json_object-mode
+  // providers without strict schema enforcement).
+  function extractJson(text) {
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      /* fall through */
+    }
+    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fenced) {
+      try {
+        return JSON.parse(fenced[1]);
+      } catch (e) {
+        /* fall through */
+      }
+    }
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start !== -1 && end > start) {
+      return JSON.parse(text.slice(start, end + 1));
+    }
+    throw new Error('Model reply was not valid JSON.');
+  }
+
+  function parseChatResponse(providerId, responseText) {
+    const provider = getProvider(providerId);
+    let parsed;
+    try {
+      parsed = JSON.parse(responseText);
+    } catch (e) {
+      throw new Error('Failed to parse ' + provider.label + ' response: ' + e.message);
+    }
+    if (provider.kind === 'anthropic') {
+      const textBlock = (parsed.content || []).find((b) => b.type === 'text');
+      if (!textBlock) throw new Error('No text content in ' + provider.label + ' response.');
+      return JSON.parse(textBlock.text);
+    }
+    const choice = parsed.choices && parsed.choices[0];
+    const content = choice && choice.message && choice.message.content;
+    if (!content) throw new Error('No message content in ' + provider.label + ' response.');
+    return extractJson(content);
+  }
 
   function init(adapter) {
     // -------------------------------------------------------------------
@@ -132,55 +285,35 @@
     }
 
     // -------------------------------------------------------------------
-    // Anthropic API calls
+    // LLM calls (provider-aware)
     // -------------------------------------------------------------------
 
-    async function callClaude({ system, messages, schema }) {
-      const apiKey = await adapter.getApiKey();
-      if (!apiKey) {
-        throw new Error('No Anthropic API key set. ' + adapter.apiKeySetupHint);
+    async function callLLM({ system, messages, schema }) {
+      const settings = await adapter.getSettings();
+      const provider = getProvider(settings.provider);
+      if (provider.needsKey && !settings.apiKey) {
+        throw new Error(
+          'No ' + provider.label + ' API key set. ' + adapter.setupHint +
+          ' Or switch to the Free provider — it needs no key at all.'
+        );
       }
-      const model = await adapter.getModel();
+      const model = settings.model || provider.defaultModel;
 
-      const body = {
+      const req = buildChatRequest(provider.id, {
+        apiKey: settings.apiKey,
         model,
-        max_tokens: 4096,
         system,
         messages,
-        output_config: {
-          format: {
-            type: 'json_schema',
-            schema,
-          },
-        },
-      };
-
-      const res = await adapter.httpRequest({
-        method: 'POST',
-        url: ANTHROPIC_URL,
-        headers: {
-          'content-type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          'anthropic-dangerous-direct-browser-access': 'true',
-        },
-        data: JSON.stringify(body),
+        schema,
       });
+      const res = await adapter.httpRequest(req);
 
       if (res.status < 200 || res.status >= 300) {
-        throw new Error('Anthropic API error ' + res.status + ': ' + res.responseText);
+        throw new Error(
+          provider.label + ' API error ' + res.status + ': ' + String(res.responseText).slice(0, 300)
+        );
       }
-      let parsed;
-      try {
-        parsed = JSON.parse(res.responseText);
-      } catch (e) {
-        throw new Error('Failed to parse Anthropic response: ' + e.message);
-      }
-      const textBlock = (parsed.content || []).find((b) => b.type === 'text');
-      if (!textBlock) {
-        throw new Error('No text content in Anthropic response.');
-      }
-      return JSON.parse(textBlock.text);
+      return parseChatResponse(provider.id, res.responseText);
     }
 
     const QUIZ_SCHEMA = {
@@ -240,7 +373,7 @@
 
     function generateQuiz(diff, title, description) {
       const changedLines = countChangedLines(diff);
-      return callClaude({
+      return callLLM({
         system:
           'You are a code-review comprehension quiz generator. You will be given a pull ' +
           'request title, its description (the "why" - the problem being fixed, the goal), its ' +
@@ -286,7 +419,7 @@
       const qa = questions
         .map((q) => `Q (${q.id}): ${q.question}\nA: ${answers[q.id] || '(no answer)'}`)
         .join('\n\n');
-      return callClaude({
+      return callLLM({
         system:
           'You are a lenient but honest code-review comprehension grader. Given a PR title, description, ' +
           'diff, and a reviewer\'s answers to questions about it, grade each answer against what the ' +
@@ -835,5 +968,12 @@
     }
   }
 
-  global.PRQuizGuardCore = { init: init };
+  global.PRQuizGuardCore = {
+    init: init,
+    PROVIDERS: PROVIDERS,
+    DEFAULT_PROVIDER: DEFAULT_PROVIDER,
+    getProvider: getProvider,
+    buildChatRequest: buildChatRequest,
+    parseChatResponse: parseChatResponse,
+  };
 })(typeof window !== 'undefined' ? window : this);

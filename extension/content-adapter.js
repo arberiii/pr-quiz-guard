@@ -4,16 +4,26 @@
 (function () {
   'use strict';
 
-  const DEFAULT_MODEL = 'claude-haiku-4-5';
+  const Core = window.PRQuizGuardCore;
 
-  function getApiKey() {
-    return chrome.storage.local.get('prQuizGuard:apiKey').then((r) => r['prQuizGuard:apiKey'] || '');
-  }
-
-  function getModel() {
-    return chrome.storage.local
-      .get('prQuizGuard:model')
-      .then((r) => r['prQuizGuard:model'] || DEFAULT_MODEL);
+  // Storage layout: provider choice under 'prQuizGuard:provider', keys and
+  // models namespaced per provider ('prQuizGuard:apiKey:<provider>'). Legacy
+  // installs stored a single Anthropic key under 'prQuizGuard:apiKey' /
+  // 'prQuizGuard:model'; those are read as fallbacks.
+  function getSettings() {
+    return chrome.storage.local.get(null).then((r) => {
+      let providerId = r['prQuizGuard:provider'];
+      if (!providerId || !Core.PROVIDERS[providerId]) {
+        providerId = r['prQuizGuard:apiKey'] ? 'anthropic' : Core.DEFAULT_PROVIDER;
+      }
+      const legacyKey = providerId === 'anthropic' ? r['prQuizGuard:apiKey'] || '' : '';
+      const legacyModel = providerId === 'anthropic' ? r['prQuizGuard:model'] || '' : '';
+      return {
+        provider: providerId,
+        apiKey: r['prQuizGuard:apiKey:' + providerId] || legacyKey,
+        model: r['prQuizGuard:model:' + providerId] || legacyModel,
+      };
+    });
   }
 
   // Relayed through the background service worker so the request bypasses
@@ -27,10 +37,9 @@
       });
   }
 
-  window.PRQuizGuardCore.init({
-    getApiKey,
-    getModel,
+  Core.init({
+    getSettings,
     httpRequest,
-    apiKeySetupHint: 'Click the PR Quiz Guard extension icon and set it there.',
+    setupHint: 'Click the PR Quiz Guard extension icon and set it there.',
   });
 })();

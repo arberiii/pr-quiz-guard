@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         PR Quiz Guard
 // @namespace    https://github.com/
-// @version      1.3.0
+// @version      1.4.0
 // @description  Blocks GitHub PR "Approve" until you pass a short comprehension quiz generated from the actual diff.
 // @author       you
 // @match        https://github.com/*/*/pull/*
@@ -10,6 +10,8 @@
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
 // @connect      api.anthropic.com
+// @connect      api.mistral.ai
+// @connect      text.pollinations.ai
 // @connect      github.com
 // @connect      patch-diff.githubusercontent.com
 // @run-at       document-idle
@@ -19,24 +21,177 @@
 //
 // This file contains everything that doesn't depend on Tampermonkey (GM_*) or
 // Chrome-extension (chrome.*) APIs: diff/description fetching (via an injected
-// adapter), the Claude API calls, the modal UI, and the "Approve" button
+// adapter), the LLM provider layer, the modal UI, and the "Approve" button
 // interception. Platform-specific glue lives in userscript/adapter.js and
 // extension/content-adapter.js, each of which builds an `adapter` object and
 // calls PRQuizGuardCore.init(adapter).
 //
 // adapter shape:
 //   {
-//     getApiKey(): Promise<string>,
-//     getModel(): Promise<string>,
+//     getSettings(): Promise<{ provider: string, apiKey: string, model: string }>,
 //     httpRequest({ method, url, headers, data }): Promise<{ status, responseText }>,
-//     apiKeySetupHint: string,   // human-readable instructions shown when no key is set
+//     setupHint: string,   // human-readable instructions shown when no key is set
 //   }
 (function (global) {
   'use strict';
 
-  const ANTHROPIC_URL = 'https://api.anthropic.com/v1/messages';
   const MAX_DIFF_CHARS = 12000;
   const MAX_DESCRIPTION_CHARS = 3000;
+
+  // -------------------------------------------------------------------
+  // LLM providers
+  //
+  // Defined outside init() and exported on PRQuizGuardCore so the extension
+  // popup can render provider choices and build test requests from the same
+  // source of truth. `kind` selects the wire format: 'anthropic' (Messages
+  // API with native structured output) or 'openai' (chat/completions with
+  // json_object mode + schema-in-prompt).
+  // -------------------------------------------------------------------
+
+  const DEFAULT_PROVIDER = 'free';
+
+  const PROVIDERS = {
+    free: {
+      id: 'free',
+      label: 'Free',
+      tagline: 'No API key needed',
+      note: 'Community endpoint (pollinations.ai). Rate-limited but plenty for quizzes — works with zero setup.',
+      kind: 'openai',
+      url: 'https://text.pollinations.ai/openai',
+      needsKey: false,
+      defaultModel: 'openai-fast',
+      models: ['openai-fast'],
+      keyUrl: null,
+      keyPlaceholder: null,
+    },
+    mistral: {
+      id: 'mistral',
+      label: 'Mistral',
+      tagline: 'Free tier · key required',
+      note: 'Official Mistral API. The Experiment plan is free — create a key at console.mistral.ai.',
+      kind: 'openai',
+      url: 'https://api.mistral.ai/v1/chat/completions',
+      needsKey: true,
+      defaultModel: 'mistral-small-latest',
+      models: ['mistral-small-latest', 'mistral-medium-latest', 'mistral-large-latest', 'open-mistral-nemo'],
+      keyUrl: 'https://console.mistral.ai/api-keys',
+      keyPlaceholder: 'Mistral API key',
+    },
+    anthropic: {
+      id: 'anthropic',
+      label: 'Claude',
+      tagline: 'API key required',
+      note: 'Anthropic API. Create a key at platform.claude.com.',
+      kind: 'anthropic',
+      url: 'https://api.anthropic.com/v1/messages',
+      needsKey: true,
+      defaultModel: 'claude-haiku-4-5',
+      models: ['claude-haiku-4-5', 'claude-sonnet-5'],
+      keyUrl: 'https://platform.claude.com',
+      keyPlaceholder: 'sk-ant-…',
+    },
+  };
+
+  function getProvider(providerId) {
+    return PROVIDERS[providerId] || PROVIDERS[DEFAULT_PROVIDER];
+  }
+
+  // Builds the {method,url,headers,data} for one structured-output chat call.
+  function buildChatRequest(providerId, { apiKey, model, system, messages, schema }) {
+    const provider = getProvider(providerId);
+    if (provider.kind === 'anthropic') {
+      return {
+        method: 'POST',
+        url: provider.url,
+        headers: {
+          'content-type': 'application/json',
+          'x-api-key': apiKey,
+          'anthropic-version': '2023-06-01',
+          'anthropic-dangerous-direct-browser-access': 'true',
+        },
+        data: JSON.stringify({
+          model,
+          max_tokens: 4096,
+          system,
+          messages,
+          output_config: {
+            format: {
+              type: 'json_schema',
+              schema,
+            },
+          },
+        }),
+      };
+    }
+    // OpenAI-compatible chat/completions (Mistral, Pollinations). These don't
+    // all support strict json_schema output, so ask for json_object mode and
+    // put the schema in the system prompt, then parse defensively.
+    const headers = { 'content-type': 'application/json' };
+    if (apiKey) headers['authorization'] = 'Bearer ' + apiKey;
+    return {
+      method: 'POST',
+      url: provider.url,
+      headers,
+      data: JSON.stringify({
+        model,
+        max_tokens: 4096,
+        messages: [
+          {
+            role: 'system',
+            content:
+              system +
+              '\n\nRespond with ONLY a single JSON object — no prose, no code fences — that conforms exactly to this JSON Schema:\n' +
+              JSON.stringify(schema),
+          },
+        ].concat(messages),
+        response_format: { type: 'json_object' },
+      }),
+    };
+  }
+
+  // Pulls a valid JSON object out of a model reply that may be wrapped in
+  // code fences or surrounded by stray prose (common on json_object-mode
+  // providers without strict schema enforcement).
+  function extractJson(text) {
+    try {
+      return JSON.parse(text);
+    } catch (e) {
+      /* fall through */
+    }
+    const fenced = text.match(/```(?:json)?\s*([\s\S]*?)```/);
+    if (fenced) {
+      try {
+        return JSON.parse(fenced[1]);
+      } catch (e) {
+        /* fall through */
+      }
+    }
+    const start = text.indexOf('{');
+    const end = text.lastIndexOf('}');
+    if (start !== -1 && end > start) {
+      return JSON.parse(text.slice(start, end + 1));
+    }
+    throw new Error('Model reply was not valid JSON.');
+  }
+
+  function parseChatResponse(providerId, responseText) {
+    const provider = getProvider(providerId);
+    let parsed;
+    try {
+      parsed = JSON.parse(responseText);
+    } catch (e) {
+      throw new Error('Failed to parse ' + provider.label + ' response: ' + e.message);
+    }
+    if (provider.kind === 'anthropic') {
+      const textBlock = (parsed.content || []).find((b) => b.type === 'text');
+      if (!textBlock) throw new Error('No text content in ' + provider.label + ' response.');
+      return JSON.parse(textBlock.text);
+    }
+    const choice = parsed.choices && parsed.choices[0];
+    const content = choice && choice.message && choice.message.content;
+    if (!content) throw new Error('No message content in ' + provider.label + ' response.');
+    return extractJson(content);
+  }
 
   function init(adapter) {
     // -------------------------------------------------------------------
@@ -149,55 +304,35 @@
     }
 
     // -------------------------------------------------------------------
-    // Anthropic API calls
+    // LLM calls (provider-aware)
     // -------------------------------------------------------------------
 
-    async function callClaude({ system, messages, schema }) {
-      const apiKey = await adapter.getApiKey();
-      if (!apiKey) {
-        throw new Error('No Anthropic API key set. ' + adapter.apiKeySetupHint);
+    async function callLLM({ system, messages, schema }) {
+      const settings = await adapter.getSettings();
+      const provider = getProvider(settings.provider);
+      if (provider.needsKey && !settings.apiKey) {
+        throw new Error(
+          'No ' + provider.label + ' API key set. ' + adapter.setupHint +
+          ' Or switch to the Free provider — it needs no key at all.'
+        );
       }
-      const model = await adapter.getModel();
+      const model = settings.model || provider.defaultModel;
 
-      const body = {
+      const req = buildChatRequest(provider.id, {
+        apiKey: settings.apiKey,
         model,
-        max_tokens: 4096,
         system,
         messages,
-        output_config: {
-          format: {
-            type: 'json_schema',
-            schema,
-          },
-        },
-      };
-
-      const res = await adapter.httpRequest({
-        method: 'POST',
-        url: ANTHROPIC_URL,
-        headers: {
-          'content-type': 'application/json',
-          'x-api-key': apiKey,
-          'anthropic-version': '2023-06-01',
-          'anthropic-dangerous-direct-browser-access': 'true',
-        },
-        data: JSON.stringify(body),
+        schema,
       });
+      const res = await adapter.httpRequest(req);
 
       if (res.status < 200 || res.status >= 300) {
-        throw new Error('Anthropic API error ' + res.status + ': ' + res.responseText);
+        throw new Error(
+          provider.label + ' API error ' + res.status + ': ' + String(res.responseText).slice(0, 300)
+        );
       }
-      let parsed;
-      try {
-        parsed = JSON.parse(res.responseText);
-      } catch (e) {
-        throw new Error('Failed to parse Anthropic response: ' + e.message);
-      }
-      const textBlock = (parsed.content || []).find((b) => b.type === 'text');
-      if (!textBlock) {
-        throw new Error('No text content in Anthropic response.');
-      }
-      return JSON.parse(textBlock.text);
+      return parseChatResponse(provider.id, res.responseText);
     }
 
     const QUIZ_SCHEMA = {
@@ -257,7 +392,7 @@
 
     function generateQuiz(diff, title, description) {
       const changedLines = countChangedLines(diff);
-      return callClaude({
+      return callLLM({
         system:
           'You are a code-review comprehension quiz generator. You will be given a pull ' +
           'request title, its description (the "why" - the problem being fixed, the goal), its ' +
@@ -303,7 +438,7 @@
       const qa = questions
         .map((q) => `Q (${q.id}): ${q.question}\nA: ${answers[q.id] || '(no answer)'}`)
         .join('\n\n');
-      return callClaude({
+      return callLLM({
         system:
           'You are a lenient but honest code-review comprehension grader. Given a PR title, description, ' +
           'diff, and a reviewer\'s answers to questions about it, grade each answer against what the ' +
@@ -852,7 +987,14 @@
     }
   }
 
-  global.PRQuizGuardCore = { init: init };
+  global.PRQuizGuardCore = {
+    init: init,
+    PROVIDERS: PROVIDERS,
+    DEFAULT_PROVIDER: DEFAULT_PROVIDER,
+    getProvider: getProvider,
+    buildChatRequest: buildChatRequest,
+    parseChatResponse: parseChatResponse,
+  };
 })(typeof window !== 'undefined' ? window : this);
 
 // PR Quiz Guard — Tampermonkey adapter. Wires the shared engine (core.js) up
@@ -861,35 +1003,102 @@
 (function () {
   'use strict';
 
-  const DEFAULT_MODEL = 'claude-haiku-4-5';
+  const Core = window.PRQuizGuardCore;
+  const PROVIDERS = Core.PROVIDERS;
 
-  function getApiKey() {
-    return Promise.resolve(GM_getValue('prQuizGuard:apiKey', ''));
+  // Storage layout: provider choice under 'prQuizGuard:provider', keys and
+  // models namespaced per provider so switching back and forth never loses
+  // anything. Legacy installs stored a single Anthropic key under
+  // 'prQuizGuard:apiKey' / 'prQuizGuard:model'; those are read as fallbacks.
+  function currentProviderId() {
+    const stored = GM_getValue('prQuizGuard:provider', '');
+    if (stored && PROVIDERS[stored]) return stored;
+    // Legacy install with an Anthropic key set keeps working unchanged.
+    return GM_getValue('prQuizGuard:apiKey', '') ? 'anthropic' : Core.DEFAULT_PROVIDER;
   }
 
-  function getModel() {
-    return Promise.resolve(GM_getValue('prQuizGuard:model', DEFAULT_MODEL));
+  function getKeyFor(providerId) {
+    const key = GM_getValue('prQuizGuard:apiKey:' + providerId, '');
+    if (key) return key;
+    return providerId === 'anthropic' ? GM_getValue('prQuizGuard:apiKey', '') : '';
   }
 
-  GM_registerMenuCommand('Set Anthropic API Key', () => {
-    const current = GM_getValue('prQuizGuard:apiKey', '');
+  function getModelFor(providerId) {
+    const model = GM_getValue('prQuizGuard:model:' + providerId, '');
+    if (model) return model;
+    return providerId === 'anthropic' ? GM_getValue('prQuizGuard:model', '') : '';
+  }
+
+  function getSettings() {
+    const providerId = currentProviderId();
+    return Promise.resolve({
+      provider: providerId,
+      apiKey: getKeyFor(providerId),
+      model: getModelFor(providerId),
+    });
+  }
+
+  // -------------------------------------------------------------------
+  // Menu commands (labels are snapshotted at registration; page reload
+  // refreshes them after a change)
+  // -------------------------------------------------------------------
+
+  const active = PROVIDERS[currentProviderId()];
+
+  GM_registerMenuCommand('Provider: ' + active.label + ' — change…', () => {
+    const ids = Object.keys(PROVIDERS);
+    const menu = ids
+      .map((id, i) => `${i + 1}) ${PROVIDERS[id].label} — ${PROVIDERS[id].tagline}`)
+      .join('\n');
+    const answer = prompt('Choose LLM provider:\n\n' + menu + '\n\nEnter a number:', String(ids.indexOf(currentProviderId()) + 1));
+    if (!answer) return;
+    const chosen = ids[parseInt(answer.trim(), 10) - 1];
+    if (!chosen) {
+      alert('Invalid choice.');
+      return;
+    }
+    GM_setValue('prQuizGuard:provider', chosen);
+    const p = PROVIDERS[chosen];
+    if (p.needsKey && !getKeyFor(chosen)) {
+      const key = prompt(p.label + ' API key (get one at ' + p.keyUrl + '):');
+      if (key && key.trim()) GM_setValue('prQuizGuard:apiKey:' + chosen, key.trim());
+    }
+    alert('Provider set to ' + p.label + '. Reload the PR page to apply.');
+  });
+
+  GM_registerMenuCommand('Set API key (' + active.label + ')', () => {
+    const providerId = currentProviderId();
+    const p = PROVIDERS[providerId];
+    if (!p.needsKey) {
+      alert(p.label + ' needs no API key — you are all set.');
+      return;
+    }
+    const current = getKeyFor(providerId);
     const next = prompt(
-      'Anthropic API key (starts with sk-ant-):',
+      p.label + ' API key (get one at ' + p.keyUrl + '):',
       current ? '••••••••' + current.slice(-4) : ''
     );
     if (next && !next.startsWith('••••')) {
-      GM_setValue('prQuizGuard:apiKey', next.trim());
+      GM_setValue('prQuizGuard:apiKey:' + providerId, next.trim());
       alert('API key saved.');
     }
   });
 
-  GM_registerMenuCommand('Set Model (current: ' + GM_getValue('prQuizGuard:model', DEFAULT_MODEL) + ')', () => {
-    const next = prompt('Model ID to use for quiz generation/grading:', GM_getValue('prQuizGuard:model', DEFAULT_MODEL));
-    if (next && next.trim()) {
-      GM_setValue('prQuizGuard:model', next.trim());
-      alert('Model set to ' + next.trim() + '. Reload the page to apply.');
+  GM_registerMenuCommand(
+    'Set model (' + active.label + ', current: ' + (getModelFor(currentProviderId()) || active.defaultModel) + ')',
+    () => {
+      const providerId = currentProviderId();
+      const p = PROVIDERS[providerId];
+      const next = prompt(
+        'Model for ' + p.label + ' (suggestions: ' + p.models.join(', ') + '):',
+        getModelFor(providerId) || p.defaultModel
+      );
+      if (next && next.trim()) {
+        GM_setValue('prQuizGuard:model:' + providerId, next.trim());
+        alert('Model set to ' + next.trim() + '. Reload the page to apply.');
+      }
     }
-  });
+  );
 
   // Dispatched by the browser extension itself (not the page), bypassing
   // github.com's service worker and any page-level CORS restrictions.
@@ -910,10 +1119,9 @@
     });
   }
 
-  window.PRQuizGuardCore.init({
-    getApiKey,
-    getModel,
+  Core.init({
+    getSettings,
     httpRequest,
-    apiKeySetupHint: 'Use the Tampermonkey menu → "Set Anthropic API Key".',
+    setupHint: 'Use the Tampermonkey menu → "Set API key".',
   });
 })();

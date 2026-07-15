@@ -15,7 +15,7 @@ const root = __dirname;
 const HEADER = `// ==UserScript==
 // @name         PR Quiz Guard
 // @namespace    https://github.com/
-// @version      1.3.0
+// @version      1.4.0
 // @description  Blocks GitHub PR "Approve" until you pass a short comprehension quiz generated from the actual diff.
 // @author       you
 // @match        https://github.com/*/*/pull/*
@@ -24,6 +24,8 @@ const HEADER = `// ==UserScript==
 // @grant        GM_xmlhttpRequest
 // @grant        GM_registerMenuCommand
 // @connect      api.anthropic.com
+// @connect      api.mistral.ai
+// @connect      text.pollinations.ai
 // @connect      github.com
 // @connect      patch-diff.githubusercontent.com
 // @run-at       document-idle
