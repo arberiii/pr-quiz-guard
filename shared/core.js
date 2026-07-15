@@ -407,6 +407,16 @@
       ['keydown', 'keyup', 'keypress'].forEach((type) => {
         overlay.addEventListener(type, (e) => e.stopPropagation());
       });
+      // Same idea for mouse/pointer events: GitHub's review popover light-dismisses
+      // on any pointerdown/click outside itself, and interacting with the quiz modal
+      // counts as "outside". If the popover closes while the quiz is open, the
+      // "Submit review" button we captured goes stale and the post-pass auto-approve
+      // silently no-ops. Containing these events keeps the review dialog open.
+      ['pointerdown', 'pointerup', 'mousedown', 'mouseup', 'click', 'focusin', 'focusout'].forEach(
+        (type) => {
+          overlay.addEventListener(type, (e) => e.stopPropagation());
+        }
+      );
       return { host, overlay, card };
     }
 
@@ -613,7 +623,17 @@
             currentIndex = 0;
             renderQuestion();
           };
-          row.appendChild(document.createElement('span'));
+          // Escape hatch: approve despite the failed quiz. Deliberately does NOT
+          // mark the passed-cache — the quiz will run again next time this diff
+          // is approved elsewhere.
+          const approveAnyway = document.createElement('button');
+          approveAnyway.className = 'btn-text';
+          approveAnyway.textContent = 'Approve anyway';
+          approveAnyway.onclick = () => {
+            destroyModal(host);
+            resolve(true);
+          };
+          row.appendChild(approveAnyway);
           const rightWrap = document.createElement('div');
           rightWrap.className = 'row-right';
           rightWrap.appendChild(cancel);
@@ -658,9 +678,12 @@
       return null;
     }
 
+    // The submit button's label follows the selected radio ("Submit review",
+    // "Submit comments", sometimes just "Approve"), so match any button whose
+    // text starts with submit/approve rather than one exact label.
     function findSubmitButtonIn(dialog) {
       return Array.from(dialog.querySelectorAll('button')).find((b) =>
-        /submit review/i.test(b.textContent)
+        /^(submit|approve)/i.test(b.textContent.trim())
       );
     }
 
@@ -739,11 +762,76 @@
 
     function reclick(target) {
       bypass = true;
-      target.click();
-      // Reset shortly after; form submission/navigation will have already been triggered.
-      setTimeout(() => {
-        bypass = false;
-      }, 500);
+      // The quiz can stay open for a while; GitHub's React UI may have re-rendered
+      // (or closed) the review popover in the meantime, detaching the button we
+      // captured. Clicking a detached node never reaches React's delegated
+      // listeners, so re-resolve from the live DOM before giving up.
+      let btn = target && target.isConnected ? target : null;
+      if (!btn) {
+        const dialog = findOpenApproveDialog();
+        btn = dialog ? findSubmitButtonIn(dialog) : null;
+      }
+      if (btn) {
+        btn.click();
+        // Reset shortly after; form submission/navigation will have already been triggered.
+        setTimeout(() => {
+          bypass = false;
+        }, 500);
+        return;
+      }
+      // The review dialog closed entirely while the quiz was open — reopen it,
+      // re-select Approve, and submit, so a passed quiz always approves.
+      reopenAndApprove().finally(() => {
+        setTimeout(() => {
+          bypass = false;
+        }, 500);
+      });
+    }
+
+    function waitFor(check, timeoutMs) {
+      return new Promise((resolve, reject) => {
+        const deadline = Date.now() + timeoutMs;
+        (function poll() {
+          const result = check();
+          if (result) return resolve(result);
+          if (Date.now() > deadline) return reject(new Error('timed out'));
+          setTimeout(poll, 100);
+        })();
+      });
+    }
+
+    async function reopenAndApprove() {
+      // GitHub's trigger for the review popover is "Review changes" in the old
+      // files-changed UI and "Submit comments" / "Submit review" in the 2026
+      // /changes UI (verified against the live DOM). Exclude buttons that are
+      // already inside a dialog so we only match the page-level trigger.
+      const trigger = Array.from(document.querySelectorAll('button')).find(
+        (b) =>
+          !b.closest('[role="dialog"]') &&
+          /^(review changes|submit comments|submit review|finish your review)/i.test(
+            b.textContent.trim()
+          )
+      );
+      if (!trigger) return;
+      trigger.click();
+      try {
+        const dialog = await waitFor(() => {
+          for (const d of document.querySelectorAll('[role="dialog"]')) {
+            if (d.querySelector('input[type=radio][name="reviewEvent"]')) return d;
+          }
+          return null;
+        }, 3000);
+        const approveRadio = Array.from(
+          dialog.querySelectorAll('input[type=radio][name="reviewEvent"]')
+        ).find((r) => /approve/i.test(r.value));
+        if (!approveRadio) return;
+        approveRadio.click();
+        const submitButton = await waitFor(() => findSubmitButtonIn(dialog), 3000);
+        submitButton.click();
+      } catch (e) {
+        // Reopen failed (UI changed or too slow) — the passed result is cached, so
+        // the user's next manual Approve goes straight through without a quiz.
+      }
     }
   }
 
